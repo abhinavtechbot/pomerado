@@ -160,6 +160,73 @@ export interface BrokenInput {
   readonly change: "removed" | "required" | "changed";
 }
 
+/**
+ * A closed code as core writes one: snake_case (`autofill_recipe_not_verified`) or PascalCase
+ * (`CredentialTargetRefused`), at most 64 characters, so no page text fits. Each code comes from
+ * a closed type where it is set (a `MintFailure` reason, a sign-in failure code, a host check);
+ * the checkpoint checks its shape rather than listing every code, so a code a later release adds
+ * still reads.
+ */
+const ClosedCode = Schema.String.pipe(
+  Schema.pattern(/^(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*|[A-Z][A-Za-z0-9]*)$/u),
+  Schema.maxLength(64),
+);
+/**
+ * The host check that refused a step the build needs, which a `host_refused` ending stands on, by
+ * closed codes alone, never page text:
+ * - `publication`: the host's own publication checks refused a finish_build, with the failure's
+ *   code and its reason;
+ * - `sign_in_step`: the host refused a sign-in step, with the sign-in's code and the check that
+ *   refused it;
+ * - `task_update`: the host refused to apply a task update, with its reason, or `other` for one
+ *   core does not name.
+ */
+export const HostRefusalSource = Schema.Union(
+  Schema.Struct({
+    source: Schema.Literal("publication"),
+    // Only the host's own publication checks set it, which fail as this code.
+    code: Schema.Literal("PublicationUnavailable"),
+    reason: Schema.optionalWith(ClosedCode, { exact: true }),
+  }),
+  Schema.Struct({
+    source: Schema.Literal("sign_in_step"),
+    code: Schema.Literal(
+      "CredentialTargetRefused",
+      "CredentialTargetUnverified",
+      "AutofillRefused",
+    ),
+    check: Schema.optionalWith(ClosedCode, { exact: true }),
+  }),
+  Schema.Struct({
+    source: Schema.Literal("task_update"),
+    reason: Schema.Literal(
+      "intake_refused",
+      "duplicate_tool",
+      "site_unavailable",
+      "change_unsupported",
+      "other",
+    ),
+  }),
+);
+export type HostRefusalSource = typeof HostRefusalSource.Type;
+
+/**
+ * What a `host_refused` ending stood on, in the blocked diagnostic: the source that set the
+ * attempt's host refusal (`HostRefusalSource`), a sign-in screen the host refused because the
+ * password's fills are spent (`sign_in_refill`), one it refused at its destination check
+ * (`sign_in_destination`), live tests the host refuses with no batch left (`live_tests_spent`), and
+ * a refusal an older worker's checkpoint kept without its source (`unrecorded`).
+ */
+export type HostRefusalBasis =
+  | HostRefusalSource
+  | {
+      readonly source:
+        | "sign_in_refill"
+        | "sign_in_destination"
+        | "live_tests_spent"
+        | "unrecorded";
+    };
+
 export class MintFailure extends Data.TaggedError("MintFailure")<{
   readonly rejectedCredential?: typeof CredentialRejectedField.Type;
   /** Sub-cause, operation, underlying error, stack and context; see ERROR-LOGGING-STANDARD.md. */
@@ -359,7 +426,10 @@ export class MintFailure extends Data.TaggedError("MintFailure")<{
     | "confirmation_undeclared"
     /** A write session's composed script names none of its commit steps in `write.commits`. */
     | "commit_marks_undeclared"
-    /** The composed script declares a commit step no act step of the session ever entered. */
+    /**
+     * The composed script declares a commit step no act step of the session ever entered, and
+     * `write.commitsUnproven` does not name it as one after the last mark the session entered.
+     */
     | "commit_marks_unentered"
     /**
      * The session has not settled every commit mark of its recorded write path;
@@ -1236,8 +1306,10 @@ export type PublicationRequest = typeof PublicationRequest.Type;
  *   or its cited sources, a file it needs is missing, or it rules out going on, such as a stop
  *   condition it set that cannot be met. A missing fact the caller could supply is asked instead.
  *   Its basis is the report's `intent` citing the request: a field its input holds or words of its
- *   instruction (`citesCallerRequest`). The explanation says what the caller should supply or
- *   change. Optional: no host has to handle it until its core reports it.
+ *   instruction (`citesCallerRequest`), or a task update the owner confirmed in an answer, by its
+ *   revision or its words (`citesConfirmedUpdate`), such as a stop condition the owner picked that
+ *   the build then met. The explanation says what the caller should supply or change. Optional:
+ *   no host has to handle it until its core reports it.
  * The host refuses each ending without its basis on record. A `policy` report whose only basis is
  * the owner's no or an unanswered question ends as `owner_declined` or `question_unanswered`. A
  * target on another registrable domain is never a reason by itself: Guardian reviews such work.
@@ -1996,6 +2068,17 @@ export interface MintHarnessSnapshot {
    */
   readonly hostRefused?: true;
   /**
+   * Each host check whose refusal `hostRefused` stands on, in the order they refused, as
+   * `{ refusal, beforeSignIn }`: the check (`HostRefusalSource`), and `beforeSignIn: true` once a
+   * later authenticate may have sent the login, so a sign-in step's refusal no longer keeps a
+   * `host_refused` ending apart from an unconfirmed sign-in. Optional, so an older worker ignores
+   * it and a newer one restores an older checkpoint without it. Unknown here and decoded
+   * leniently when restored, entry by entry: a `source` or reason a later release adds would
+   * otherwise fail an older worker's decode of the whole checkpoint during a rollout, so an entry
+   * it cannot read restores as no source (`unrecorded`).
+   */
+  readonly hostRefusalSources?: unknown;
+  /**
    * A host check refused a step earlier in this attempt, and a later finish_build got past the
    * host's checks to Guardian's review, clearing `hostRefused`: a `host_refused` block is refused
    * as `host_refusal_passed` until a host check refuses a step again. Optional, so an older worker
@@ -2198,6 +2281,7 @@ export const MintHarnessSnapshot: Schema.Schema<MintHarnessSnapshot> = Schema.St
   blockedReviewUnavailable: Schema.optionalWith(Schema.Literal(true), { exact: true }),
   guardianRefused: Schema.optionalWith(Schema.Literal(true), { exact: true }),
   hostRefused: Schema.optionalWith(Schema.Literal(true), { exact: true }),
+  hostRefusalSources: Schema.optionalWith(Schema.Unknown, { exact: true }),
   hostRefusalPassed: Schema.optionalWith(Schema.Literal(true), { exact: true }),
   signInDestinationRefused: Schema.optionalWith(Schema.Literal(true), { exact: true }),
   noAnswerHandBacks: Schema.optionalWith(Schema.NonNegativeInt, { exact: true }),
@@ -2259,7 +2343,8 @@ export type PublicationRecovery =
 /**
  * One publication decision, a refusal or a publication, as typed host evidence. The harness
  * writes it, never the agent, so a review reads what the host decided instead of the agent's
- * account of it. Every field is finite host metadata: no source, output or rationale text.
+ * account of it. Every field but `instruction` is finite host metadata: no source, output or
+ * rationale text.
  */
 export interface PublicationDecision {
   /** The harness's reference for this decision, unique in the build; tool results carry it. */
@@ -2285,6 +2370,12 @@ export interface PublicationDecision {
    */
   readonly failedChecks: readonly string[];
   readonly recovery: PublicationRecovery;
+  /**
+   * A refusal's instruction as `finish_build` gave it to the minter, the host's own account of
+   * what the refusal requires, screened and capped. Absent for a publication, a refusal the
+   * answer carried no instruction for, and a decision recorded before hosts kept it.
+   */
+  readonly instruction?: string;
 }
 
 /**
@@ -2401,6 +2492,8 @@ export interface MintDependencies {
      * Rejoins or reads a tool call a takeover found started but not returned. A recovered
      * execution's evidence must carry the `review` the host journaled, `action` included: a write
      * is tracked, and its repeat refused, only when its evidence says Guardian labelled it one.
+     * A `request_input` call it fails with `noResponse`, such as a question that expired before
+     * the takeover, goes on as an unanswered live question does (`suspendUnanswered`).
      */
     readonly recoverTool?: (call: RecoveryToolCall) => Effect.Effect<
       | {
@@ -2515,7 +2608,10 @@ export interface MintDependencies {
    *   it started; no further model call starts; and the run ends interrupted, as
    *   `attemptFinished` reports. A resumed attempt restores `agentRecovery.initial` and rejoins
    *   that call through `agentRecovery.recoverTool`, such as with the answer the owner gave
-   *   meanwhile. Recovered evidence that still carries `noResponse` is unanswered again.
+   *   meanwhile. Recovered evidence that still carries `noResponse` is unanswered again, and so
+   *   is a rejoined question that `recoverTool` fails with `noResponse`: it is offered with no
+   *   `requestId`, which the harness never learned, for the host to match to the question it
+   *   rejoined.
    * - `not_suspended`, or a failure, which is recorded: the build ends as `no_response`. So does
    *   `suspended` when the model run ended while the hook ran, which is recorded too.
    * Absent, every such build ends as `no_response`.

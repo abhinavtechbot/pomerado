@@ -48,6 +48,8 @@ import {
   defaultLiveTestCaseMs,
   ExecutionRefusal,
   ExecutionRequest,
+  type HostRefusalBasis,
+  HostRefusalSource,
   isReadOrWriteChoice,
   LiveTestsRequest,
   MintFailure,
@@ -79,7 +81,7 @@ import { finiteCaptureGap, finiteRunnerFailure } from "./runner-failure.js";
 import { isSecretHandle } from "./secret-handles.js";
 import { fileReadbackRule } from "./file-readback.js";
 import { cardReadbackRule } from "./card-readback.js";
-import { citesCallerRequest } from "./caller-citation.js";
+import { citesCallerRequest, citesConfirmedUpdate } from "./caller-citation.js";
 import type {
   AcceptedTaskUpdate,
   AllowedExecution,
@@ -423,6 +425,8 @@ const reviewedLiveTestBatches = 4;
 const ledgerBounds = {
   denials: 12,
   rationaleChars: 800,
+  /** A publication refusal's instruction, kept whole: its last step is what a review checks. */
+  instructionChars: 1_600,
   findings: 4,
   findingChars: 300,
   testFailures: 20,
@@ -513,11 +517,59 @@ const hostRefusalDecision = (
  * credentials may not, or somewhere it could not verify. An autofill refusal of another check,
  * such as a field the selector did not find or matched twice, is the minter's to correct.
  */
-const hostSignInRefusal = (error: MintFailure) =>
-  error.authentication?.code === "CredentialTargetRefused" ||
-  error.authentication?.code === "CredentialTargetUnverified" ||
-  (error.authentication?.code === "AutofillRefused" &&
-    error.authentication.hostRefusal?.check === "destination");
+const hostSignInRefusalCode = (
+  error: MintFailure,
+): Extract<HostRefusalSource, { source: "sign_in_step" }>["code"] | undefined => {
+  const code = error.authentication?.code;
+  return code === "CredentialTargetRefused" ||
+    code === "CredentialTargetUnverified" ||
+    (code === "AutofillRefused" && error.authentication?.hostRefusal?.check === "destination")
+    ? code
+    : undefined;
+};
+const hostSignInRefusal = (error: MintFailure) => hostSignInRefusalCode(error) !== undefined;
+/** A task update refusal's reason as a closed code: one core names, else `other`. */
+const taskUpdateRefusalCode = (
+  reason: string,
+): Extract<HostRefusalSource, { source: "task_update" }>["reason"] =>
+  reason === "intake_refused" ||
+  reason === "duplicate_tool" ||
+  reason === "site_unavailable" ||
+  reason === "change_unsupported"
+    ? reason
+    : "other";
+/**
+ * The standing host refusals a checkpoint kept (`MintHarnessSnapshot.hostRefusalSources`), read
+ * entry by entry: a source this worker cannot decode, such as one a later release added, reads as
+ * none (`unrecorded`), and a checkpoint that kept none, from an older worker, as one unrecorded
+ * refusal.
+ */
+const restoredHostRefusals = (kept: unknown) => {
+  const entries = Array.isArray(kept) ? (kept as readonly unknown[]) : [];
+  const restored = entries.map((entry) => {
+    const record = typeof entry === "object" && entry !== null ? entry : {};
+    return {
+      refusal: Option.getOrUndefined(
+        Schema.decodeUnknownOption(HostRefusalSource)(Reflect.get(record, "refusal")),
+      ),
+      beforeSignIn: Reflect.get(record, "beforeSignIn") === true,
+    };
+  });
+  return restored.length > 0 ? restored : [{ refusal: undefined, beforeSignIn: false }];
+};
+/**
+ * Whether a host refusal a `host_refused` report stands on is apart from an unconfirmed sign-in,
+ * so the report keeps its reason: a sign-in screen the host refused at its destination check,
+ * which a later password or code screen that passes clears; a sign-in step the host refused with
+ * no login sent since (`beforeSignIn` false); and a task update the host refused. A publication or
+ * live tests refused while the sign-in never confirmed may be its consequence, such as a recipe
+ * nothing verified, as may a refused refill, and a refusal an older checkpoint kept without its
+ * source is unknown: none of them keeps the reason.
+ */
+const hostRefusalApartFromSignIn = (refusal: HostRefusalBasis, beforeSignIn: boolean) =>
+  refusal.source === "sign_in_destination" ||
+  refusal.source === "task_update" ||
+  (refusal.source === "sign_in_step" && !beforeSignIn);
 /**
  * A failure's code as diagnostics and publication evidence name it. A review whose outcome
  * Guardian kept refusing fails as `ReviewUnavailable`, but it is a verdict that did not form, not
@@ -1172,7 +1224,10 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
           if (authentication?.state === "authenticated") {
             signInUnconfirmed = false;
             signInRefusalOnly = false;
-          } else if (effect !== "not_sent") signInUnconfirmed = true;
+          } else if (effect !== "not_sent") {
+            signInUnconfirmed = true;
+            loginSentSinceHostRefusals();
+          }
           return;
         }
         // One that failed past its dispatch fence may have sent the login, unless it says it
@@ -1184,8 +1239,11 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
           failure?.loginDeclined === undefined &&
           failure?.authentication?.nothingSubmitted !== true &&
           failure?.execution?.dispatch !== "not_sent"
-        )
+        ) {
           signInUnconfirmed = true;
+          // The host's own refusal of this authenticate is no later login sent after it.
+          if (!(failure !== undefined && hostSignInRefusal(failure))) loginSentSinceHostRefusals();
+        }
       };
       /**
        * The host's identical refusals in a row while typing into a sign-in screen: the latest
@@ -1271,6 +1329,33 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
        * review clears it, setting `hostRefusalPassed`.
        */
       let hostRefused = recovered?.hostRefused === true;
+      /**
+       * Each host check whose refusal `hostRefused` stands on, in the order they refused, once each
+       * (`MintHarnessSnapshot.hostRefusalSources`): the check, undefined when a checkpoint kept the
+       * refusal without a source this worker can read (`unrecorded`), and whether a later
+       * authenticate may have sent the login since (`beforeSignIn`), after which a sign-in step's
+       * refusal is no longer the latest sign-in event.
+       */
+      let standingHostRefusals: {
+        readonly refusal: HostRefusalSource | undefined;
+        beforeSignIn: boolean;
+      }[] = hostRefused ? restoredHostRefusals(recovered?.hostRefusalSources) : [];
+      /**
+       * Records a host check's refusal of a step the build needs. The same check refusing again
+       * moves to the end, as a refusal after any login sent since.
+       */
+      const refuseByHost = (refusal: HostRefusalSource) => {
+        hostRefused = true;
+        const key = JSON.stringify(refusal);
+        standingHostRefusals = [
+          ...standingHostRefusals.filter((standing) => JSON.stringify(standing.refusal) !== key),
+          { refusal, beforeSignIn: false },
+        ];
+      };
+      /** A later authenticate may have sent the login after every host refusal standing now. */
+      const loginSentSinceHostRefusals = () => {
+        for (const standing of standingHostRefusals) standing.beforeSignIn = true;
+      };
       /**
        * A host check refused a step earlier in this attempt, and a later finish_build got past the
        * host's checks to Guardian's review, so no host refusal stands until another is recorded.
@@ -2070,10 +2155,23 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
           const settled = yield* Effect.either(answer);
           const pending = takePendingDecision();
           if (pending === undefined) return yield* settled;
-          const decision = yield* recordDecision(pending);
+          const parsed = settled._tag === "Left" ? undefined : decodeJsonObject(settled.right);
+          // A refusal keeps the instruction its answer gave the minter, so a later review reads
+          // what the refusal requires: screened as the ledger's host refusals are, and capped. A
+          // screen that fails keeps none.
+          const told = parsed?._tag === "Right" ? parsed.right.instruction : undefined;
+          const instruction =
+            pending.outcome !== "refused" || typeof told !== "string"
+              ? undefined
+              : yield* screenMintText(dependencies, told).pipe(
+                  Effect.map((screened) => capped(screened.trim(), ledgerBounds.instructionChars)),
+                  Effect.orElseSucceed(() => undefined),
+                );
+          const decision = yield* recordDecision(
+            instruction === undefined || instruction === "" ? pending : { ...pending, instruction },
+          );
           if (settled._tag === "Left") return yield* settled;
-          const parsed = decodeJsonObject(settled.right);
-          return parsed._tag === "Left"
+          return parsed === undefined || parsed._tag === "Left"
             ? settled.right
             : JSON.stringify({ ...parsed.right, decisionId: decision.decisionId });
         });
@@ -2425,6 +2523,24 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
             instruction: "The build's owner did not answer in time. The host is ending this build.",
           });
         });
+      /**
+       * The minter's own question went unanswered, whether asked live or rejoined by a takeover:
+       * it goes back to the minter as no answer where it may, and otherwise the build ends, unless
+       * the host suspends it. An owner's cancel is a choice to stop, never a question to decide
+       * without. `requestId` is the question's id when the harness knows it, which a takeover's
+       * replayed call does not.
+       */
+      const questionUnanswered = (
+        error: MintFailure,
+        requestId: string | undefined,
+        endsBuild: boolean,
+      ) =>
+        error.ownerCancelled !== true && handsBackNoAnswer()
+          ? noAnswer(endsBuild ? undefined : requestId)
+          : unanswered(error, "asking a question", {
+              step: "question",
+              ...(requestId === undefined ? {} : { requestId }),
+            });
       const reviewFeedback = (error: MintFailure, signIn: boolean) =>
         Effect.gen(function* () {
           // A refusal Guardian marked correctable names a fix, so no policy block stands on it.
@@ -2891,7 +3007,15 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
       };
       const providerFeedback = (failed: MintFailure, now: number) => {
         const error = countHostRefusal(failed);
-        if (hostSignInRefusal(error)) hostRefused = true;
+        const signInRefusal = hostSignInRefusalCode(error);
+        if (signInRefusal !== undefined)
+          refuseByHost({
+            source: "sign_in_step",
+            code: signInRefusal,
+            ...(error.authentication?.hostRefusal?.check === undefined
+              ? {}
+              : { check: error.authentication.hostRefusal.check }),
+          });
         const runnerFailure = screenedRunnerFailure(error);
         // A capture the host could not produce or screen is a gap: the result is withheld, the
         // effect possible, and the build goes on.
@@ -3381,6 +3505,13 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
         | {
             readonly reason: (typeof BuildBlocked.Type)["reason"];
             readonly basis?: "live_tests_spent";
+            /** What a `host_refused` ending stood on, each host check in force. */
+            readonly hostRefusals?: readonly HostRefusalBasis[];
+            /**
+             * A `host_refused` ending stands on a host refusal apart from an unconfirmed sign-in
+             * (`hostRefusalApartFromSignIn`), so it keeps its reason.
+             */
+            readonly apartFromSignIn?: true;
           }
         | { readonly refusal: string } => {
         const refused = (
@@ -3460,8 +3591,8 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
             `The owner's no answered whether to end the build, which means keep going, so it is not ${ending} and the build has not ended.${publicationDenial === undefined ? "" : " If Guardian's latest decision asks for evidence nobody can supply, stop: the build ends with Guardian's decision."}`,
           );
         const unanswered = noAnswerHandBacks > 0;
-        const hostCheckRefusing =
-          hostRefused || dependencies.signInRefillRefused?.() === true || signInDestinationRefused;
+        const refillRefused = dependencies.signInRefillRefused?.() === true;
+        const hostCheckRefusing = hostRefused || refillRefused || signInDestinationRefused;
         const liveTestsSpent = liveTestsRefusal !== undefined && !liveTestsRefusal.reserveOpen;
         const hostRefusing = hostCheckRefusing || liveTestsSpent;
         if (reason === "owner_declined" && !ownerRefused && stopDeclined)
@@ -3492,14 +3623,18 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
           );
         }
         // A caller_input ending stands on its intent citing the caller's own request: a field the
-        // task's input holds, or words of the request's instruction.
+        // task's input holds, or words of the request's instruction. A task update the owner
+        // confirmed in an answer is that request too, as the effective task every later review
+        // reads, so the intent may cite it instead, by its revision or its words: a stop condition
+        // the owner picked, which the build then checked and met, ends as the caller's own rule.
         if (
           reason === "caller_input" &&
-          !citesCallerRequest(intent, request.intent, taskState.businessInput)
+          !citesCallerRequest(intent, request.intent, taskState.businessInput) &&
+          !citesConfirmedUpdate(intent, taskState.updates)
         )
           return refused(
             "caller_input_not_cited",
-            "caller_input needs the caller's own request as its basis, so the build has not ended. In intent, name the request field that stops the build, or quote the words of the caller's instruction, then call report_blocked again. Prefer another reason when the site, the owner or a host check stopped it.",
+            "caller_input needs the caller's own request, or a task update the owner confirmed, as its basis, so the build has not ended. In intent, name the request field or the update's revision that stops the build, or quote the words of the caller's instruction or of that update, then call report_blocked again. Prefer another reason when the site or a host check stopped it.",
           );
         if (reason === "host_refused" && !hostRefusing && hostRefusalPassed)
           return refused(
@@ -3525,10 +3660,31 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
             "Nothing in this attempt refused this: Guardian made no final refusal of an execution, and refused no publication for privacy or authority or for a finding no correction gets past. Use host_refused when a host check refused a step the build needs and nothing left in this attempt can fix it. A publication denial or escalation that names a correction or missing evidence is not a refusal: fix every finding and gather each missing item its rationale names, then call finish_build again. Your instructions are not a refusal either, so the build has not ended. Continue through the page's own controls. Ask the owner with request_input when only they can decide; their no is owner_declined, their choice to end the build is owner_ended, and a question left unanswered is question_unanswered. Use site_lacks_capability only when the site does not offer what the task needs.",
           );
         }
-        // A report that stands only on refused live tests names them, for the record.
-        return reason === "host_refused" && liveTestsSpent && !hostCheckRefusing
-          ? { reason, basis: "live_tests_spent" }
-          : { reason };
+        if (reason !== "host_refused") return { reason };
+        // A host_refused report names each host check it stands on, for the record; one that
+        // stands only on refused live tests names them as its basis too.
+        // A refusal kept without a source this worker reads is `unrecorded`.
+        const standing = hostRefused
+          ? standingHostRefusals.map(({ refusal, beforeSignIn }) => ({
+              refusal: refusal ?? { source: "unrecorded" as const },
+              beforeSignIn,
+            }))
+          : [];
+        const others: HostRefusalBasis[] = [
+          ...(refillRefused ? [{ source: "sign_in_refill" as const }] : []),
+          ...(signInDestinationRefused ? [{ source: "sign_in_destination" as const }] : []),
+          ...(liveTestsSpent ? [{ source: "live_tests_spent" as const }] : []),
+        ];
+        const apart =
+          standing.some(({ refusal, beforeSignIn }) =>
+            hostRefusalApartFromSignIn(refusal, beforeSignIn),
+          ) || others.some((refusal) => hostRefusalApartFromSignIn(refusal, false));
+        return {
+          reason,
+          ...(liveTestsSpent && !hostCheckRefusing ? { basis: "live_tests_spent" as const } : {}),
+          hostRefusals: [...standing.map(({ refusal }) => refusal), ...others],
+          ...(apart ? { apartFromSignIn: true as const } : {}),
+        };
       };
       /**
        * Guardian's question review of a blocked explanation before any caller reads it, with the
@@ -3915,7 +4071,7 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
             // The host refused to apply the update, such as a site change, by its own check. The
             // harness's refusals before review, and one the host failed to apply, are no host
             // check refusing a step.
-            hostRefused = true;
+            refuseByHost({ source: "task_update", reason: taskUpdateRefusalCode(result.reason) });
             return taskUpdateAnswer("update_refused", {
               reason: result.reason,
               notice: yield* screenMintText(dependencies, result.notice),
@@ -4273,7 +4429,7 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
         });
       const emptyCases: LiveTestCasesFile = { cases: [] };
       /** What a signed-in read designs, in place of a read signed out's suite. */
-      const signedInPlanInstruction = `This read signed in, so it runs live tests on at most ${signedInTestInputLimit} distinct inputs beyond its example, as the testing skill says: one combined case in ${liveTestCasesPath} that sets every optional input and filter the example left unset, with values the site shows (a picker's options, or values in the example's own rows, never a person's or record's name, number or email). Choose each value so at least one example row fails it while some rows still pass every filter, since a value every example row already satisfies passes even when the tool ignores it, and name in purpose the row each value excludes. Set next_page true when the tool pages. Add a second case only for inputs that cannot be set with the others, and one made-up key for an input that takes a record's own key (testing skill). Then run it with live_tests action run and check that every row it returns satisfies each input it set, that the excluded rows are gone, and that page two holds new rows. Running it again after a fix, or on src/tool-http.mjs, is free.`;
+      const signedInPlanInstruction = `This read signed in, so it runs live tests on at most ${signedInTestInputLimit} distinct inputs beyond its example, as the testing skill says: one combined case in ${liveTestCasesPath} that sets every optional input and filter the example left unset, with values the site shows (a picker's options, or values in the example's own rows, never a person's or record's name, number or email). Choose each value so at least one example row fails it while some rows still pass every filter, since a value every example row already satisfies passes even when the tool ignores it, and name in purpose the row each value excludes. Set next_page true when the tool pages. Add a second case only for inputs that cannot be set with the others, and one no-match case, a made-up key for an input that takes a record's own id, key or URL, else a query or filter the site has no results for (testing skill). Then run it with live_tests action run and check that every row it returns satisfies each input it set, that the excluded rows are gone, and that page two holds new rows. Running it again after a fix, or on src/tool-http.mjs, is free.`;
       /** What the agent reads about its tests: its cases and their results. */
       const liveTestPlanView = (
         entrypoint: string,
@@ -5611,7 +5767,14 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
                 !publicationOutage(publication.left) &&
                 publication.left.reason !== "example_output_unavailable" &&
                 !askedOnceReasons.has(publication.left.reason ?? "");
-              if (hostChecksRefused) hostRefused = true;
+              if (hostChecksRefused)
+                refuseByHost({
+                  source: "publication",
+                  code: publication.left.code,
+                  ...(publication.left.reason === undefined
+                    ? {}
+                    : { reason: publication.left.reason }),
+                });
               if (publication._tag === "Right" || reviewDecided(publication.left)) {
                 yield* reviewCompleted;
                 // A completed review replaces the input feedback an earlier one returned.
@@ -5620,6 +5783,7 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
                 // host refusal no longer stands: what Guardian decided is what the build answers.
                 if (hostRefused && !hostChecksRefused) {
                   hostRefused = false;
+                  standingHostRefusals = [];
                   hostRefusalPassed = true;
                 }
               }
@@ -6085,7 +6249,7 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
                       : error.reason === "commit_marks_undeclared"
                         ? "Not published: the composed script names none of its commit steps. List every step that can change the site (an autosave, a saved form step, the final submit) in order as write.commits, such as commits: ['save-address', 'place-order'], using short lowercase hyphenated names, and mark each with the context's enteringCommit(name) right before the execute call that can send it (an HTTP implementation calls journal.enteringCommit(name) before that request). Opening a form and typing into its fields are not commit steps unless the site's requests show they save the caller's change; a lookup, suggestion, validation or analytics request saves nothing. Then call finish_build again with the same executionId."
                         : error.reason === "commit_marks_unentered"
-                          ? "Not published: the composed script declares a commit step that no act step of the session entered, so nothing shows its marks follow the real commit. Declare exactly the marks the session's act steps entered, marked by the same helper the composed script uses, and call finish_build again with the same executionId. If the session's steps entered none, it cannot publish: never run the write again for this; end the build and say its commit steps were not marked."
+                          ? "Not published: the composed script declares a commit step that no act step of the session entered, so nothing shows its marks follow the real commit. Declare exactly the marks the session's act steps entered, marked by the same helper the composed script uses, and call finish_build again with the same executionId. If the session stopped before later save steps because the caller's facts ran out, declare those steps in commitsUnproven; publication records them as unproven until a run reaches them. Keep them in commits too, after the entered ones. If the session's steps entered none, it cannot publish: never run the write again for this; end the build and say its commit steps were not marked."
                           : error.reason === "confirmation_unrecorded"
                             ? "Not published: the declared write confirmation does not match the session. Name the act step that recorded the declared confirmation, or declare what the session actually read; a session that recorded a confirmation is never unverifiable. Then call finish_build again."
                             : error.reason === "contract_input_mismatch"
@@ -6333,14 +6497,7 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
             }).pipe(
               Effect.catchIf(
                 (error) => error.noResponse !== undefined,
-                // An owner's cancel is a choice to stop, never a question to decide without.
-                (error) =>
-                  error.ownerCancelled !== true && handsBackNoAnswer()
-                    ? noAnswer(askingEndsBuild ? undefined : askingId)
-                    : unanswered(error, "asking a question", {
-                        step: "question",
-                        ...(askingId === undefined ? {} : { requestId: askingId }),
-                      }),
+                (error) => questionUnanswered(error, askingId, askingEndsBuild),
               ),
               Effect.ensuring(
                 Effect.sync(() => {
@@ -6463,10 +6620,18 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
                     // their choice to end the build keep their endings, a policy report renamed to
                     // one included. A host refusal a later finish_build got past is still a
                     // refusal on record.
+                    // A host_refused report keeps its reason when a host check stopped the build
+                    // apart from the sign-in (`hostRefusalApartFromSignIn`), such as a sign-in
+                    // screen refused at its destination after the login went out. One that stands
+                    // only on what may follow from the unconfirmed sign-in, such as a refused
+                    // refill or a publication of a recipe nothing verified, ends as sign-in
+                    // unavailable, its record naming the checks.
+                    const hostRefusals = "hostRefusals" in ending ? ending.hostRefusals : undefined;
                     if (
                       ending.reason !== "owner_declined" &&
                       ending.reason !== "question_unanswered" &&
                       ending.reason !== "owner_ended" &&
+                      !("apartFromSignIn" in ending && ending.apartFromSignIn === true) &&
                       (signInUnconfirmed ||
                         (signInRefusalOnly && !hostRefused && !hostRefusalPassed)) &&
                       unresolvedSignIn === undefined &&
@@ -6483,6 +6648,7 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
                         phase: "blocked",
                         reason: "sign_in_unavailable",
                         reported: report.reason,
+                        ...(hostRefusals === undefined ? {} : { hostRefusals }),
                         ...(sessionLoss === undefined ? {} : { sessionLoss }),
                       });
                       return endedForSignIn;
@@ -6554,6 +6720,7 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
                       phase: "blocked",
                       reason: blocked.reason,
                       ...(basis === undefined ? {} : { basis }),
+                      ...(hostRefusals === undefined ? {} : { hostRefusals }),
                       explanationReview: review.outcome,
                     });
                     return JSON.stringify({
@@ -7132,6 +7299,14 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
         ...(guardianRefused ? { guardianRefused: true as const } : {}),
         ...(signInRefusalOnly ? { signInRefusalOnly: true as const } : {}),
         ...(hostRefused ? { hostRefused: true as const } : {}),
+        ...(hostRefused && standingHostRefusals.length > 0
+          ? {
+              hostRefusalSources: standingHostRefusals.map(({ refusal, beforeSignIn }) => ({
+                ...(refusal === undefined ? {} : { refusal }),
+                ...(beforeSignIn ? { beforeSignIn: true as const } : {}),
+              })),
+            }
+          : {}),
         ...(hostRefusalPassed ? { hostRefusalPassed: true as const } : {}),
         ...(signInDestinationRefused ? { signInDestinationRefused: true as const } : {}),
         ...(noAnswerHandBacks === 0 ? {} : { noAnswerHandBacks }),
@@ -7173,8 +7348,18 @@ export const runMint = (input: unknown): Effect.Effect<MintOutcome, MintFailure,
                     : {
                         recoverTool: (call) =>
                           Effect.gen(function* () {
-                            const recoveredTool = yield* agentRecovery.recoverTool?.(call) ??
-                              Effect.succeed(undefined);
+                            const rejoined = yield* Effect.either(
+                              agentRecovery.recoverTool?.(call) ?? Effect.succeed(undefined),
+                            );
+                            if (rejoined._tag === "Left") {
+                              const error = rejoined.left;
+                              if (call.name !== "request_input" || error.noResponse === undefined)
+                                return yield* Effect.fail(error);
+                              // A rejoined question that went unanswered, such as one that expired
+                              // before the takeover, goes on as the live question would have.
+                              return { result: yield* questionUnanswered(error, undefined, false) };
+                            }
+                            const recoveredTool = rejoined.right;
                             if (recoveredTool === undefined) return undefined;
                             if (recoveredTool.input !== undefined) {
                               const { request: asked, answers } = recoveredTool.input;
