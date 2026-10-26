@@ -7,8 +7,10 @@ import type { InputAsker } from "../runtime/input-request.js";
 import type { SessionTyping } from "./authentication.js";
 import type { PomeradoOptions } from "./contracts.js";
 import { error, mintError } from "./errors.js";
+import { configuredProviders } from "./model-provider.js";
 export const makeSession = (options: PomeradoOptions) =>
   Effect.gen(function* () {
+    const providers = yield* Effect.try({ try: () => configuredProviders(options), catch: error });
     if (options.browser !== undefined && "cdp" in options.browser)
       return yield* Effect.fail(
         new Error(
@@ -56,7 +58,7 @@ export const makeSession = (options: PomeradoOptions) =>
     // One typing memory for the session's browser, across every build on it.
     const signInTyping: SessionTyping = { typed: false };
     return {
-      options,
+      options: { ...options, ...providers },
       browser,
       policy,
       secrets,

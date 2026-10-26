@@ -22,7 +22,8 @@ Options
   --effect read|write|ask  Mint authority (default ask)
   --timeout-seconds N      Session budget (default 1200)
 
-Set OPENAI_API_KEY before minting. A run makes no model request and needs no key.
+Set OPENAI_API_KEY before minting, or set POMERADO_MODEL_PROVIDER=openrouter and
+OPENROUTER_API_KEY. A run makes no model request and needs no key.
 A run ignores --intent and --effect. Questions are asked in this terminal.
 `;
 

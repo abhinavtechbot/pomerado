@@ -21,7 +21,8 @@ Options
   --headed           Show local Chromium
 
 The mint root defaults to ./integrations. Supply model credentials in the environment to
-mint. Serving makes no model request and needs no model credentials.
+mint. Set POMERADO_MODEL_PROVIDER=openrouter and OPENROUTER_API_KEY to use OpenRouter.
+Serving makes no model request and needs no model credentials.
 Stdout is reserved for MCP. Human questions use provide_input through your MCP client.
 `;
 

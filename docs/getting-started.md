@@ -6,7 +6,7 @@ This guide installs Pomerado, connects it to your MCP client and builds a first 
 
 - macOS or Linux.
 - Node 24.21 or a later Node 24 release. `node --version` should print `v24.21.0` or higher, below `v25`.
-- An OpenAI API key for an account that can use `gpt-6.1-sol` and `gpt-6-luna`. Pomerado calls OpenAI models to build and review integrations. Your agent can run on any model.
+- An OpenAI or OpenRouter API key for an account that can use `gpt-6.1-sol` and `gpt-6-luna`. Pomerado calls these models to build and review integrations. Your agent can run on any model.
 - An MCP client that runs local stdio servers.
 
 ## Install
@@ -39,10 +39,22 @@ Pomerado is a standard MCP stdio server.
 
 - `mint` starts the server that builds integrations.
 - `--root` is the folder where Pomerado saves them. It defaults to `./integrations` in the server's working folder, and clients pick that folder differently. Use an absolute path.
-- The server needs `OPENAI_API_KEY` in its environment. Many clients pass servers only a short list of variables, so check your client below.
+- By default the server needs `OPENAI_API_KEY` in its environment. Many clients pass servers only a short list of variables, so check your client below. For OpenRouter, see [OpenRouter](#openrouter).
 - Starting the server and listing its tools launches no browser and calls no model.
 
 ## Client settings
+
+### OpenRouter
+
+Set `POMERADO_MODEL_PROVIDER=openrouter` and provide `OPENROUTER_API_KEY` in the server's environment. Pomerado uses the same OpenAI models through OpenRouter for minting and reviews. Requests are sent to OpenRouter and its selected model provider. Configure your MCP client to pass both variables to the server; the OpenAI-specific client examples below need to be adapted accordingly. Setting `POMERADO_MODEL_PROVIDER=openai` or leaving it unset uses the default OpenAI provider.
+
+For a checkout linked to Infisical with an `OPENROUTER_API_KEY` in its development environment, start the built server from the checkout with:
+
+```sh
+POMERADO_MODEL_PROVIDER=openrouter infisical run --env=dev -- node dist/typescript/src/standalone/mcp-cli.js mint --root /absolute/path/to/pomerado-integrations
+```
+
+When launching through an MCP client, arrange for the client to start the server through Infisical, or inject both variables into the client environment and forward them to the server. Keep the key out of the client configuration and the repository.
 
 Each entry says how to add Pomerado, how the key reaches the server, and which timeouts apply. "Verified" means we added Pomerado with that client and saw the server connect. "From the docs" means the entry follows the client's own documentation. Each entry links the docs it follows.
 

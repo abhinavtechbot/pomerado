@@ -45,7 +45,7 @@ Prerequisites
 
 - macOS or Linux
 - Node 24.21 or a later Node 24 release, which you can check with `node --version`
-- An OpenAI API key, since Pomerado uses OpenAI models to build and review integrations. Your agent can run on any model
+- An OpenAI or OpenRouter API key, since Pomerado uses OpenAI models to build and review integrations. Your agent can run on any model
 - An MCP client that runs local servers, such as Claude Code, Codex, Cursor, VS Code, Claude Desktop or Gemini CLI
 
 Install Pomerado and the Chromium build it drives.
@@ -71,7 +71,7 @@ Pomerado runs as a standard MCP stdio server. Clients that read an `mcpServers` 
 ```
 
 - `--root` sets the folder where Pomerado saves your integrations. Use an absolute path, because each client starts servers from its own working folder
-- The server reads `OPENAI_API_KEY` from its environment, so the key never needs to appear in chat
+- By default, the server reads `OPENAI_API_KEY` from its environment, so the key never needs to appear in chat. [OpenRouter setup](docs/getting-started.md#openrouter) uses a separate environment variable.
 - Starting the server and listing its tools costs nothing. It launches no browser and calls no model until you start a mint
 
 Add Pomerado to your client with the command or file below.

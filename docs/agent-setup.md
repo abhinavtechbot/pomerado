@@ -4,7 +4,7 @@ These steps are for an AI agent that installs Pomerado for the person it works w
 
 Follow these rules throughout.
 
-- Never ask for the user's OpenAI API key in chat.
+- Never ask for the user's model provider API key in chat.
 - Never read, print, echo, test or log the key, and never write its value into a file.
 - Ask before you install software the user didn't mention, such as Node.
 - Ask before you change user-level or global configuration the user didn't mention.
@@ -88,7 +88,7 @@ Add this entry to the client's `mcpServers` file, in the place [Client settings]
 
 ## 5. Ask the user to provide the key
 
-- Tell the user the server needs `OPENAI_API_KEY` in its environment, and that Pomerado calls OpenAI models to build and review integrations.
+- Tell the user the server needs `OPENAI_API_KEY` in its environment by default, and that Pomerado calls OpenAI models to build and review integrations. If they choose OpenRouter, follow [OpenRouter setup](getting-started.md#openrouter) instead.
 - Ask the user to set the key themselves, in their shell profile or the client's own key setting. Point them to their client in [Client settings](getting-started.md#client-settings).
 - Tell the user not to paste the key into chat.
 - Claude Desktop documents no way to reference a variable. Tell the user the key would sit as plain text in the entry's `env` block. If they accept that, they add the key to the `env` block themselves.
